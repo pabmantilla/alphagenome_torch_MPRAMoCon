@@ -1,1 +1,6 @@
-alphagenome-pytorch/
+__pycache__/
+*.pyc
+training/slurm_logs/
+training/results/
+training/cache/
+weights/
