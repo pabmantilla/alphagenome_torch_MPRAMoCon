@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Two-stage fine-tune of AlphaGenome (PyTorch) on LentiMPRA data.
 
-Stage 1: Head-only training (frozen backbone) with AdamW.
+Stage 1: Head-only training (frozen backbone) with Adam + L2.
 Stage 2: Full model fine-tuning (unfrozen backbone) with lower LR.
 
 Usage:
@@ -36,7 +36,6 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from alphagenome_pytorch import AlphaGenome
-from alphagenome_pytorch.extensions.finetuning.training import create_lr_scheduler
 from alphagenome_pytorch.extensions.finetuning.transfer import remove_all_heads
 from alphagenome_pytorch.extensions.finetuning.utils import sequence_to_onehot
 
@@ -68,7 +67,7 @@ DEFAULTS = {
     "random_shift": True,
     "random_shift_likelihood": 0.5,
     "reverse_complement": True,
-    "sequence_length": 256,
+    "sequence_length": 384,
     "val_eval_frequency": 1,
     # Stage 2
     "stage2_lr": 1e-5,
@@ -228,7 +227,6 @@ class LentiMPRADataset(Dataset):
         data_dir: str,
         cell_type: str = "HepG2",
         split: str = "train",
-        sequence_length: int = 256,
         reverse_complement: bool = False,
         rc_prob: float = 0.5,
         random_shift: bool = False,
@@ -239,7 +237,6 @@ class LentiMPRADataset(Dataset):
     ) -> None:
         assert split in ("train", "val", "test"), f"Unknown split: {split!r}"
 
-        self.sequence_length = sequence_length
         self.reverse_complement = reverse_complement
         self.rc_prob = rc_prob
         self.random_shift = random_shift
@@ -261,13 +258,6 @@ class LentiMPRADataset(Dataset):
     def _build_construct(self, seq: str) -> str:
         return seq + self.PROMOTER_SEQ + self.RAND_BARCODE
 
-    def _pad_or_trim(self, onehot: np.ndarray) -> np.ndarray:
-        L = onehot.shape[0]
-        if L < self.sequence_length:
-            pad = np.zeros((self.sequence_length - L, 4), dtype=np.float32)
-            return np.concatenate([onehot, pad], axis=0)
-        return onehot[: self.sequence_length]
-
     def _apply_reverse_complement(self, onehot: np.ndarray) -> np.ndarray:
         return onehot[::-1, :][:, [3, 2, 1, 0]].copy()
 
@@ -284,12 +274,27 @@ class LentiMPRADataset(Dataset):
             shift = int(self._rng.integers(-self.max_shift, self.max_shift + 1))
             onehot = np.roll(onehot, shift, axis=0)
 
-        onehot = self._pad_or_trim(onehot)
-
         if self.reverse_complement and self._rng.random() < self.rc_prob:
             onehot = self._apply_reverse_complement(onehot)
 
         return torch.from_numpy(onehot), torch.tensor(target)
+
+
+def mpra_collate_fn(batch: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
+    """Collate with dynamic batch-wise padding (matches JAX baseline).
+
+    Each batch is right-padded with zeros to the max sequence length in that
+    batch, rather than to a fixed global sequence_length.
+    """
+    seqs, targets = zip(*batch)
+    max_len = max(s.shape[0] for s in seqs)
+    padded = []
+    for s in seqs:
+        if s.shape[0] < max_len:
+            pad = torch.zeros(max_len - s.shape[0], 4)
+            s = torch.cat([s, pad], dim=0)
+        padded.append(s)
+    return torch.stack(padded), torch.stack(targets)
 
 
 # ============================================================
@@ -378,8 +383,8 @@ class MPRAHead(nn.Module):
 
         for layer in self.hidden_layers:
             x = layer(x)
-            x = self.act_fn(x)
             x = self.dropout(x)
+            x = self.act_fn(x)
 
         x = self.output(x)
         return x.squeeze(-1)
@@ -506,111 +511,8 @@ class CachedEmbeddingDataset(Dataset):
 
 
 # ============================================================
-# Training & evaluation loops
+# Evaluation loops
 # ============================================================
-
-def train_epoch_headonly(
-    model: nn.Module,
-    head: MPRAHead,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    device: torch.device,
-    use_amp: bool = True,
-    use_cache: bool = False,
-) -> tuple[float, list[float]]:
-    """Train for one epoch with frozen backbone (or cached embeddings).
-
-    Returns (avg_loss, list_of_batch_losses).
-    """
-    if not use_cache:
-        model.eval()
-    head.train()
-
-    amp_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if use_amp and device.type == "cuda"
-        else nullcontext()
-    )
-
-    batch_losses: list[float] = []
-    pbar = tqdm(loader, desc=" train", leave=False)
-    for sequences, targets in pbar:
-        sequences = sequences.to(device)
-        targets = targets.to(device).float()
-
-        if use_cache:
-            # sequences is already encoder output
-            enc_out = sequences
-        else:
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
-            with torch.no_grad():
-                with amp_ctx:
-                    enc_out = model(
-                        sequences, organism_idx, encoder_only=True
-                    )["encoder_output"].transpose(1, 2)
-            enc_out = enc_out.detach()
-
-        with amp_ctx:
-            preds = head(enc_out)
-            loss = F.mse_loss(preds.float(), targets)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        batch_losses.append(loss.item())
-        pbar.set_postfix({"mse": f"{loss.item():.4f}"})
-
-    return float(np.mean(batch_losses)), batch_losses
-
-
-def train_epoch_full(
-    model: nn.Module,
-    head: MPRAHead,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    device: torch.device,
-    use_amp: bool = True,
-) -> tuple[float, list[float]]:
-    """Train for one epoch with unfrozen backbone (stage 2)."""
-    model.train()
-    head.train()
-
-    amp_ctx = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if use_amp and device.type == "cuda"
-        else nullcontext()
-    )
-
-    batch_losses: list[float] = []
-    pbar = tqdm(loader, desc=" train", leave=False)
-    for sequences, targets in pbar:
-        sequences = sequences.to(device)
-        targets = targets.to(device).float()
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
-
-        with amp_ctx:
-            enc_out = model(
-                sequences, organism_idx, encoder_only=True
-            )["encoder_output"].transpose(1, 2)
-            preds = head(enc_out)
-            loss = F.mse_loss(preds.float(), targets)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        batch_losses.append(loss.item())
-        pbar.set_postfix({"mse": f"{loss.item():.4f}"})
-
-    return float(np.mean(batch_losses)), batch_losses
-
 
 @torch.no_grad()
 def evaluate(
@@ -740,9 +642,16 @@ def make_summary_figure(
     axes[1].set_title(f"Best (ep {best_epoch}): r={metrics_best['pearson_r']:.3f}, rho={metrics_best['spearman_rho']:.3f}")
     axes[1].set_xlim(lims); axes[1].set_ylim(lims)
 
-    epochs_range = range(1, len(train_loss_hist) + 1)
-    axes[2].plot(epochs_range, train_loss_hist, label="Train")
-    axes[2].plot(epochs_range, valid_loss_hist, label="Valid")
+    train_epochs = range(1, len(train_loss_hist) + 1)
+    axes[2].plot(train_epochs, train_loss_hist, label="Train")
+    # Valid loss has multiple entries per epoch (intra-epoch eval); space evenly
+    n_train = len(train_loss_hist)
+    n_valid = len(valid_loss_hist)
+    if n_valid > 0 and n_train > 0:
+        valid_xs = np.linspace(0, n_train, n_valid + 1)[1:]
+    else:
+        valid_xs = []
+    axes[2].plot(valid_xs, valid_loss_hist, label="Valid", marker="o", markersize=3)
     axes[2].axvline(best_epoch, color="gray", linestyle=":", alpha=0.7, label=f"Best (epoch {best_epoch})")
     axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Loss (MSE)")
     axes[2].set_title("Training Loss"); axes[2].legend()
@@ -792,14 +701,26 @@ def make_combined_summary(
     axes[1].set_xlim(lims); axes[1].set_ylim(lims)
 
     n_s1 = len(s1_train_loss)
-    s1_epochs = list(range(1, n_s1 + 1))
-    axes[2].plot(s1_epochs, s1_train_loss, color="tab:blue", label="S1 Train")
-    axes[2].plot(s1_epochs, s1_valid_loss, color="tab:orange", label="S1 Valid")
+    s1_train_epochs = list(range(1, n_s1 + 1))
+    axes[2].plot(s1_train_epochs, s1_train_loss, color="tab:blue", label="S1 Train")
+    # Valid loss has multiple entries per epoch (intra-epoch eval); space evenly
+    n_s1_valid = len(s1_valid_loss)
+    if n_s1_valid > 0 and n_s1 > 0:
+        s1_valid_xs = np.linspace(0, n_s1, n_s1_valid + 1)[1:]
+    else:
+        s1_valid_xs = []
+    axes[2].plot(s1_valid_xs, s1_valid_loss, color="tab:orange", label="S1 Valid", marker="o", markersize=3)
 
     if s2_train_loss:
-        s2_epochs = list(range(n_s1 + 1, n_s1 + len(s2_train_loss) + 1))
-        axes[2].plot(s2_epochs, s2_train_loss, color="tab:blue", linestyle="--", label="S2 Train")
-        axes[2].plot(s2_epochs, s2_valid_loss, color="tab:orange", linestyle="--", label="S2 Valid")
+        n_s2 = len(s2_train_loss)
+        s2_train_epochs = list(range(n_s1 + 1, n_s1 + n_s2 + 1))
+        axes[2].plot(s2_train_epochs, s2_train_loss, color="tab:blue", linestyle="--", label="S2 Train")
+        n_s2_valid = len(s2_valid_loss)
+        if n_s2_valid > 0 and n_s2 > 0:
+            s2_valid_xs = n_s1 + np.linspace(0, n_s2, n_s2_valid + 1)[1:]
+        else:
+            s2_valid_xs = []
+        axes[2].plot(s2_valid_xs, s2_valid_loss, color="tab:orange", linestyle="--", label="S2 Valid", marker="o", markersize=3)
         unfreeze_x = n_s1 + 0.5
         axes[2].axvline(unfreeze_x, color="red", linestyle="-", alpha=0.7, label="Unfreeze")
         axes[2].axvline(n_s1 + s2_best_epoch, color="green", linestyle=":", alpha=0.7, label=f"S2 best (ep {s2_best_epoch})")
@@ -957,7 +878,7 @@ def main():
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
+    use_amp = False  # float32 to match JAX (no bfloat16 autocast)
 
     print(f"Device: {device}")
     print(f"Model name: {args.name}")
@@ -982,10 +903,66 @@ def main():
     if use_cache:
         cache_file = generate_cache(model, hp, data_dir, device)
 
-    # ---- Head ----
-    seq_len = hp["sequence_length"]
-    n_positions = seq_len // ENCODER_RESOLUTION_BP
+    # ---- Data (created before head so we can determine n_positions) ----
+    if use_cache:
+        train_ds = CachedEmbeddingDataset(
+            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="train",
+        )
+        val_ds = CachedEmbeddingDataset(
+            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="val",
+        )
+        test_ds = CachedEmbeddingDataset(
+            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="test",
+        )
+    else:
+        ds_kwargs = dict(
+            data_dir=data_dir, cell_type=hp["cell_type"],
+        )
+        train_ds = LentiMPRADataset(
+            **ds_kwargs, split="train",
+            reverse_complement=hp["reverse_complement"], rc_prob=0.5,
+            random_shift=hp["random_shift"], shift_prob=hp.get("random_shift_likelihood", 0.5),
+            max_shift=15,
+        )
+        val_ds = LentiMPRADataset(**ds_kwargs, split="val")
+        test_ds = LentiMPRADataset(**ds_kwargs, split="test")
+
+    # Use dynamic batch-wise padding (matches JAX baseline) for non-cache mode
+    collate = mpra_collate_fn if not use_cache else None
+    train_loader = DataLoader(
+        train_ds, batch_size=hp["batch_size"], shuffle=True,
+        num_workers=2, pin_memory=True, collate_fn=collate,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=hp["batch_size"], shuffle=False,
+        num_workers=2, pin_memory=True, collate_fn=collate,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=hp["batch_size"], shuffle=False,
+        num_workers=2, pin_memory=True, collate_fn=collate,
+    )
+
+    print(f"Train: {len(train_ds):,} samples, {len(train_loader):,} batches")
+    print(f"Val:   {len(val_ds):,} samples, {len(val_loader):,} batches")
+    print(f"Test:  {len(test_ds):,} samples, {len(test_loader):,} batches")
+
+    # ---- Head (n_positions determined from data + encoder) ----
     nl_size = hp["nl_size"] if isinstance(hp["nl_size"], list) else hp["nl_size"]
+
+    if use_cache:
+        # Cache mode: infer n_positions from cached embedding shape
+        sample_emb, _ = train_ds[0]
+        n_positions = sample_emb.shape[0]
+    else:
+        # Determine n_positions via a single forward pass through the encoder
+        sample_seq, _ = train_ds[0]
+        with torch.no_grad():
+            dummy = sample_seq.unsqueeze(0).to(device)
+            org_idx = torch.zeros(1, dtype=torch.long, device=device)
+            enc_out = model(dummy, org_idx, encoder_only=True)["encoder_output"]
+            # encoder_output is (B, D, n_pos); we transpose to (B, n_pos, D) later
+            n_positions = enc_out.shape[2]
+        print(f"Encoder produces {n_positions} positions for {sample_seq.shape[0]}bp input")
 
     head = MPRAHead(
         n_positions=n_positions,
@@ -1000,47 +977,6 @@ def main():
     print(f"MPRAHead created: {n_head:,} trainable parameters")
     print(f"  pooling={hp['pooling_type']}, nl_size={nl_size}, "
           f"dropout={hp['dropout']}, activation={hp['activation']}")
-
-    # ---- Data ----
-    if use_cache:
-        train_ds = CachedEmbeddingDataset(
-            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="train",
-        )
-        val_ds = CachedEmbeddingDataset(
-            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="val",
-        )
-        test_ds = CachedEmbeddingDataset(
-            data_dir=data_dir, cache_file=cache_file, cell_type=hp["cell_type"], split="test",
-        )
-    else:
-        ds_kwargs = dict(
-            data_dir=data_dir, cell_type=hp["cell_type"], sequence_length=seq_len,
-        )
-        train_ds = LentiMPRADataset(
-            **ds_kwargs, split="train",
-            reverse_complement=hp["reverse_complement"], rc_prob=0.5,
-            random_shift=hp["random_shift"], shift_prob=hp.get("random_shift_likelihood", 0.5),
-            max_shift=15,
-        )
-        val_ds = LentiMPRADataset(**ds_kwargs, split="val")
-        test_ds = LentiMPRADataset(**ds_kwargs, split="test")
-
-    train_loader = DataLoader(
-        train_ds, batch_size=hp["batch_size"], shuffle=True,
-        num_workers=2, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=hp["batch_size"], shuffle=False,
-        num_workers=2, pin_memory=True,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=hp["batch_size"], shuffle=False,
-        num_workers=2, pin_memory=True,
-    )
-
-    print(f"Train: {len(train_ds):,} samples, {len(train_loader):,} batches")
-    print(f"Val:   {len(val_ds):,} samples, {len(val_loader):,} batches")
-    print(f"Test:  {len(test_ds):,} samples, {len(test_loader):,} batches")
 
     # ---- Check for resume ----
     state_file = results_dir / "training_state.json"
@@ -1119,85 +1055,115 @@ def main():
         print(f"Resuming stage 1 from epoch {start_epoch}")
 
     if not s1_completed:
-        # Create optimizer and scheduler
+        # AdamW with decoupled weight decay (matches JAX: optax.adamw)
         optimizer = torch.optim.AdamW(
             head.parameters(),
             lr=hp["learning_rate"],
             weight_decay=hp["weight_decay"],
         )
-        steps_per_epoch = len(train_loader)
-        total_steps = hp["num_epochs"] * steps_per_epoch
-        warmup_steps = steps_per_epoch  # 1 epoch warmup
-        scheduler = create_lr_scheduler(
-            optimizer,
-            warmup_steps=warmup_steps,
-            total_steps=total_steps,
-            schedule="cosine",
-        )
-        # Fast-forward scheduler if resuming
-        if start_epoch > 1:
-            for _ in range((start_epoch - 1) * steps_per_epoch):
-                scheduler.step()
 
         patience = hp["early_stopping"]
-        eval_freq = hp["val_eval_frequency"]
         epochs_no_improve = 0
+        early_stop = False
+
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if use_amp and device.type == "cuda"
+            else nullcontext()
+        )
 
         print(f"\n{'='*60}")
         print(f"Stage 1: Head-only training ({'cached embeddings' if use_cache else 'frozen encoder'})")
         print(f"  LR={hp['learning_rate']}, WD={hp['weight_decay']}, BS={hp['batch_size']}")
-        print(f"  Epochs={hp['num_epochs']}, Patience={patience}, EvalFreq={eval_freq}")
-        print(f"  Scheduler: cosine with {warmup_steps} warmup steps, {total_steps} total steps")
+        print(f"  Epochs={hp['num_epochs']}, Patience={patience} epochs")
+        print(f"  Eval: once per epoch (matches JAX train_k562.py)")
         print(f"{'='*60}")
 
         for epoch in range(start_epoch, hp["num_epochs"] + 1):
-            train_loss, _ = train_epoch_headonly(
-                model=model, head=head, loader=train_loader,
-                optimizer=optimizer, scheduler=scheduler,
+            if not use_cache:
+                model.eval()
+            head.train()
+
+            batch_losses: list[float] = []
+            pbar = tqdm(train_loader, desc=f" epoch {epoch}", leave=False)
+            for sequences, targets in pbar:
+                sequences = sequences.to(device)
+                targets = targets.to(device).float()
+
+                if use_cache:
+                    enc_out = sequences
+                else:
+                    organism_idx = torch.zeros(
+                        sequences.shape[0], dtype=torch.long, device=device
+                    )
+                    with torch.no_grad():
+                        with amp_ctx:
+                            enc_out = model(
+                                sequences, organism_idx, encoder_only=True
+                            )["encoder_output"].transpose(1, 2)
+                    enc_out = enc_out.detach()
+
+                with amp_ctx:
+                    preds = head(enc_out)
+                    loss = F.mse_loss(preds.float(), targets)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                batch_losses.append(loss.item())
+                pbar.set_postfix({"mse": f"{loss.item():.4f}"})
+
+            train_loss = float(np.mean(batch_losses))
+            train_loss_history.append(train_loss)
+
+            # Validate once per epoch (matches JAX train_k562.py)
+            head.eval()
+            valid_loss = evaluate(
+                model=model, head=head, loader=val_loader,
                 device=device, use_amp=use_amp, use_cache=use_cache,
             )
-            train_loss_history.append(train_loss)
+            valid_loss_history.append(valid_loss)
+
+            print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
+                  f"| valid_loss={valid_loss:.4f}", end="")
+
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                epochs_no_improve = 0
+                best_epoch = epoch
+                best_preds, best_targets = collect_predictions(
+                    model, head, test_loader, device,
+                    use_amp=use_amp, use_cache=use_cache,
+                )
+                np.savez(
+                    results_dir / "best_predictions.npz",
+                    preds=best_preds, targets=best_targets,
+                )
+                torch.save(
+                    {"head_state_dict": head.state_dict(),
+                     "epoch": epoch, "val_loss": valid_loss},
+                    checkpoint_dir / "best_head.pt",
+                )
+                print(" * (saved)")
+            else:
+                epochs_no_improve += 1
+                print(f"  (no improve {epochs_no_improve}/{patience})")
+
+            if patience > 0 and epochs_no_improve >= patience:
+                print(f"\nEarly stopping at epoch {epoch}")
+                early_stop = True
 
             # Snapshot after epoch 1
             if epoch == 1:
                 epoch1_preds, epoch1_targets = collect_predictions(
-                    model, head, test_loader, device, use_amp=use_amp, use_cache=use_cache,
+                    model, head, test_loader, device,
+                    use_amp=use_amp, use_cache=use_cache,
                 )
-                np.savez(results_dir / "epoch1_predictions.npz",
-                         preds=epoch1_preds, targets=epoch1_targets)
-
-            # Evaluate validation every eval_freq epochs
-            if epoch % eval_freq == 0 or epoch == hp["num_epochs"]:
-                valid_loss = evaluate(
-                    model=model, head=head, loader=val_loader,
-                    device=device, use_amp=use_amp, use_cache=use_cache,
+                np.savez(
+                    results_dir / "epoch1_predictions.npz",
+                    preds=epoch1_preds, targets=epoch1_targets,
                 )
-                valid_loss_history.append(valid_loss)
-
-                is_best = valid_loss < best_valid_loss
-                if is_best:
-                    best_valid_loss = valid_loss
-                    epochs_no_improve = 0
-                    best_epoch = epoch
-                    best_preds, best_targets = collect_predictions(
-                        model, head, test_loader, device, use_amp=use_amp, use_cache=use_cache,
-                    )
-                    np.savez(results_dir / "best_predictions.npz",
-                             preds=best_preds, targets=best_targets)
-                    torch.save(
-                        {"head_state_dict": head.state_dict(), "epoch": epoch,
-                         "val_loss": valid_loss},
-                        checkpoint_dir / "best_head.pt",
-                    )
-                    star = " * (saved)"
-                else:
-                    epochs_no_improve += 1
-                    star = f"  (no improve {epochs_no_improve}/{patience})"
-
-                print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-                      f"| valid_loss={valid_loss:.4f}{star}")
-            else:
-                print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f}")
 
             # Save latest for resume
             torch.save(
@@ -1213,8 +1179,7 @@ def main():
                 s1_completed=False, s1_best_epoch=best_epoch,
             )
 
-            if epoch % eval_freq == 0 and patience > 0 and epochs_no_improve >= patience:
-                print(f"\nEarly stopping at epoch {epoch}")
+            if early_stop:
                 break
 
         # Mark stage 1 complete
@@ -1267,14 +1232,13 @@ def main():
         # Check resume for stage 2
         s2_start_epoch = 1
         s2_best_valid_loss = float("inf")
-        s2_epochs_no_improve = 0
 
         if resume_state is not None and resume_state.get("stage") == 2:
             # Possibly not used yet, but support it
             pass
 
         print(f"\n{'='*60}")
-        print(f"Stage 2: Full model fine-tuning (unfrozen backbone)")
+        print(f"Stage 2: Encoder fine-tuning (unfrozen encoder only)")
         print(f"  LR={hp['stage2_lr']}, WD={hp['weight_decay']}, BS={hp['batch_size']}")
         print(f"  Epochs={hp['stage2_epochs']}, Patience={hp['stage2_patience']}")
         print(f"{'='*60}")
@@ -1286,73 +1250,103 @@ def main():
             head.load_state_dict(ckpt["head_state_dict"])
             print(f"Restored best stage 1 head (epoch {best_epoch})")
 
-        # Unfreeze backbone
-        for param in model.parameters():
-            param.requires_grad = True
-        print("Unfroze all backbone parameters")
+        # Unfreeze encoder only (not tower/decoder) to match JAX baseline
+        encoder_params = []
+        for name, param in model.named_parameters():
+            if name.startswith("encoder."):
+                param.requires_grad = True
+                encoder_params.append(param)
+        n_unfrozen = sum(p.numel() for p in encoder_params)
+        print(f"Unfroze encoder parameters only ({n_unfrozen:,} params)")
 
         # New data loaders without augmentations disabled? No — keep same loaders.
         # Stage 2 uses same data.
 
-        # New optimizer for all params
-        all_params = list(model.parameters()) + list(head.parameters())
+        # AdamW with decoupled weight decay (matches JAX: optax.adamw)
+        s2_params = encoder_params + list(head.parameters())
         s2_optimizer = torch.optim.AdamW(
-            all_params,
+            s2_params,
             lr=hp["stage2_lr"],
             weight_decay=hp["weight_decay"],
         )
-        s2_steps_per_epoch = len(train_loader)
-        s2_total_steps = hp["stage2_epochs"] * s2_steps_per_epoch
-        s2_warmup_steps = s2_steps_per_epoch  # 1 epoch warmup
-        s2_scheduler = create_lr_scheduler(
-            s2_optimizer,
-            warmup_steps=s2_warmup_steps,
-            total_steps=s2_total_steps,
-            schedule="cosine",
-        )
 
         s2_patience = hp["stage2_patience"]
+        s2_epochs_no_improve = 0
+        s2_early_stop = False
+
+        s2_amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if use_amp and device.type == "cuda"
+            else nullcontext()
+        )
 
         for epoch in range(s2_start_epoch, hp["stage2_epochs"] + 1):
-            train_loss, _ = train_epoch_full(
-                model=model, head=head, loader=train_loader,
-                optimizer=s2_optimizer, scheduler=s2_scheduler,
-                device=device, use_amp=use_amp,
-            )
+            model.train()
+            head.train()
+            # Only encoder params have requires_grad=True; tower/decoder frozen
 
-            s2_train_loss_history.append(train_loss)
-
-            # Evaluate validation every eval_freq epochs
-            if epoch % eval_freq == 0 or epoch == hp["stage2_epochs"]:
-                valid_loss = evaluate(
-                    model=model, head=head, loader=val_loader,
-                    device=device, use_amp=use_amp, use_cache=False,
+            batch_losses: list[float] = []
+            pbar = tqdm(train_loader, desc=f" S2 epoch {epoch}", leave=False)
+            for sequences, targets in pbar:
+                sequences = sequences.to(device)
+                targets = targets.to(device).float()
+                organism_idx = torch.zeros(
+                    sequences.shape[0], dtype=torch.long, device=device
                 )
-                s2_valid_loss_history.append(valid_loss)
 
-                is_best = valid_loss < s2_best_valid_loss
-                if is_best:
-                    s2_best_valid_loss = valid_loss
-                    s2_epochs_no_improve = 0
-                    s2_best_epoch = epoch
-                    s2_best_preds, s2_best_targets = collect_predictions(
-                        model, head, test_loader, device, use_amp=use_amp,
-                    )
-                    torch.save(
-                        {"model_state_dict": model.state_dict(),
-                         "head_state_dict": head.state_dict(),
-                         "epoch": epoch, "val_loss": valid_loss},
-                        checkpoint_dir / "best_stage2.pt",
-                    )
-                    star = " * (saved)"
-                else:
-                    s2_epochs_no_improve += 1
-                    star = f"  (no improve {s2_epochs_no_improve}/{s2_patience})"
+                with s2_amp_ctx:
+                    enc_out = model(
+                        sequences, organism_idx, encoder_only=True
+                    )["encoder_output"].transpose(1, 2)
+                    preds = head(enc_out)
+                    loss = F.mse_loss(preds.float(), targets)
 
-                print(f"S2 Epoch {epoch:03d} | train_loss={train_loss:.4f} "
-                      f"| valid_loss={valid_loss:.4f}{star}")
+                s2_optimizer.zero_grad()
+                loss.backward()
+                s2_optimizer.step()
+
+                batch_losses.append(loss.item())
+                pbar.set_postfix({"mse": f"{loss.item():.4f}"})
+
+            s2_train_loss = float(np.mean(batch_losses))
+            s2_train_loss_history.append(s2_train_loss)
+
+            # Validate once per epoch (matches JAX train_k562.py)
+            model.eval()
+            head.eval()
+            valid_loss = evaluate(
+                model=model, head=head, loader=val_loader,
+                device=device, use_amp=use_amp, use_cache=False,
+            )
+            s2_valid_loss_history.append(valid_loss)
+
+            print(f"S2 Epoch {epoch:03d} | train_loss={s2_train_loss:.4f} "
+                  f"| valid_loss={valid_loss:.4f}", end="")
+
+            if valid_loss < s2_best_valid_loss:
+                s2_best_valid_loss = valid_loss
+                s2_epochs_no_improve = 0
+                s2_best_epoch = epoch
+                s2_best_preds, s2_best_targets = collect_predictions(
+                    model, head, test_loader, device, use_amp=use_amp,
+                )
+                _skip = ("tower.", "decoder.")
+                encoder_sd = {k: v for k, v in model.state_dict().items()
+                              if not k.startswith(_skip)}
+                torch.save(
+                    {"model_state_dict": encoder_sd,
+                     "head_state_dict": head.state_dict(),
+                     "epoch": epoch, "val_loss": valid_loss},
+                    checkpoint_dir / "best_stage2.pt",
+                )
+                print(" * (saved)")
             else:
-                print(f"S2 Epoch {epoch:03d} | train_loss={train_loss:.4f}")
+                s2_epochs_no_improve += 1
+                print(f"  (no improve {s2_epochs_no_improve}/{s2_patience})")
+
+            if s2_patience > 0 and s2_epochs_no_improve >= s2_patience:
+                print(f"\nStage 2 early stopping at epoch {epoch}")
+                s2_early_stop = True
 
             # Save state for resume
             save_training_state(
@@ -1366,8 +1360,7 @@ def main():
                 s2_best_epoch=s2_best_epoch,
             )
 
-            if epoch % eval_freq == 0 and s2_patience > 0 and s2_epochs_no_improve >= s2_patience:
-                print(f"\nStage 2 early stopping at epoch {epoch}")
+            if s2_early_stop:
                 break
 
         if s2_best_preds is not None:
