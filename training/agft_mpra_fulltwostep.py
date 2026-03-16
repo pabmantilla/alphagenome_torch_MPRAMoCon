@@ -1348,6 +1348,17 @@ def main():
                 print(f"\nStage 2 early stopping at epoch {epoch}")
                 s2_early_stop = True
 
+            # Save latest stage 2 checkpoint (for overfit analysis)
+            _skip = ("tower.", "decoder.")
+            latest_encoder_sd = {k: v for k, v in model.state_dict().items()
+                                 if not k.startswith(_skip)}
+            torch.save(
+                {"model_state_dict": latest_encoder_sd,
+                 "head_state_dict": head.state_dict(),
+                 "epoch": epoch, "val_loss": valid_loss},
+                checkpoint_dir / "latest_stage2.pt",
+            )
+
             # Save state for resume
             save_training_state(
                 state_file, stage=2, epoch=epoch,
