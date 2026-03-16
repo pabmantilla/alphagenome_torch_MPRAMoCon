@@ -1,0 +1,4 @@
+[submodule "interp/eigen-interactions"]
+	path = interp/eigen-interactions
+	url = git@github.com:pabmantilla/eigen-interactions.git
+	branch = main
