@@ -1,6 +1,37 @@
+# --- environments ---
+seam_venv/
+*venv*/
 __pycache__/
 *.pyc
+
+# --- existing main: training artifacts / weights ---
 training/slurm_logs/
 training/results/
 training/cache/
 weights/
+
+# --- large data / artifacts (keep code only) ---
+data/
+results/*.png
+SEAM_jointlib900/results/
+SEAM_jointlib900/scripts/slurm_logs/
+
+# --- big binary formats anywhere ---
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.bam
+*.bigwig
+*.bw
+*.parquet
+*.err
+*.out
+
+# keep the small joint-900 library pickle, ignore any other pickles
+*.pkl
+!SEAM_jointlib900/libraries/jointlib900_library.pkl
+
+# --- misc ---
+.ipynb_checkpoints/
+.DS_Store
